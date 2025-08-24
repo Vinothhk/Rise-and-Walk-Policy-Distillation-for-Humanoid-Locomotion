@@ -1,7 +1,7 @@
 ## Clone this repository
 ```
-git clone https://github.com/your-username/drl_humanoid_project.git
-cd drl_humanoid_project
+git clone https://github.com/Vinothhk/Rise-and-Walk-Policy-Distillation-for-Humanoid-Locomotion.git
+cd Rise-and-Walk-Policy-Distillation-for-Humanoid-Locomotion
 ```
 
 ## Create VirtualEnv
