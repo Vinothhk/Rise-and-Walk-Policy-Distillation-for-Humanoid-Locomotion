@@ -1,0 +1,4 @@
+sac-teacher : Already best and logged in WANDB (humanoid-drl-teacher)
+teacher-train: PPO and Logged in WANDB humanoid-drl-teacher
+
+teacher-train-sac: trying to find optimal

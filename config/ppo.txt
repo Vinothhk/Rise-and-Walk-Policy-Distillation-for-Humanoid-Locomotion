@@ -1,0 +1,24 @@
+/* current best ppo:
+   # Build PPO
+     model = PPO(
+         policy=config["policy_type"],
+         env=env,
+         learning_rate=config["learning_rate"],
+         n_steps=config["n_steps"],
+         batch_size=config["batch_size"],
+         n_epochs=config["n_epochs"],
+         gamma=config["gamma"],
+         gae_lambda=config["gae_lambda"],
+         clip_range=config["clip_range"],
+         ent_coef=config["ent_coef"],
+         vf_coef=config["vf_coef"],
+         max_grad_norm=config["max_grad_norm"],
+         target_kl=config["target_kl"],
+         use_sde=config["use_sde"],
+         sde_sample_freq=config["sde_sample_freq"],
+         policy_kwargs=config["policy_kwargs"],
+         verbose=1,
+         tensorboard_log=f"runs/{run.id}",
+         seed=config["seed"],
+         device="auto",
+     ) */
