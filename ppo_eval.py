@@ -1,30 +1,62 @@
+# evaluate_ppo.py
+import os, time
 import gymnasium as gym
-import torch
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, VecEnv
 
-# Load trained model
-model_path = "models/ppo1/best_model.zip"
-vecnorm_path = "models/ppo1/vecnormalize.pkl"
+ENV_NAME   = "HumanoidStandup-v5"
+RUN_DIR    = "models/ppo1"                # folder that holds best_model.zip + vecnormalize.pkl
+MODEL_FILE = "best_model.zip"             # or "teacher_policy_final_ppo.zip"
+VEC_FILE   = "vecnormalize.pkl"           # must exist for 1:1 performance
+RENDER     = True                         # set False for headless eval
+EPISODES   = 5
 
-# Load environment (must match training)
-eval_env = gym.make("HumanoidStandup-v5")
+def make_render_env(render: bool) -> VecEnv:
+    def _make():
+        return gym.make(ENV_NAME, render_mode="human" if render else None)
+    return DummyVecEnv([_make])
 
-# Load VecNormalize stats
-eval_env = VecNormalize.load(vecnorm_path, eval_env)
-eval_env.training = False      # important: don’t update stats
-eval_env.norm_reward = False   # important: keep raw rewards for eval
+def main():
+    model_path = os.path.join(RUN_DIR, MODEL_FILE)
+    vec_path   = os.path.join(RUN_DIR, VEC_FILE)
 
-# Load model
-model = PPO.load(model_path, env=eval_env, device="cuda")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model not found: {model_path}")
+    if not os.path.exists(vec_path):
+        raise FileNotFoundError(f"VecNormalize file not found: {vec_path}")
 
-# Run evaluation
-obs = eval_env.reset()
-done = False
-ep_reward = 0
-while not done:
-    action, _ = model.predict(obs, deterministic=True)  # <-- deterministic!
-    obs, reward, done, info = eval_env.step(action)
-    ep_reward += reward
+    # Base env
+    base_env = make_render_env(RENDER)
 
-print(f"Episode Reward: {ep_reward}")
+    # Load VecNormalize stats onto the base env
+    eval_env = VecNormalize.load(vec_path, base_env)
+    eval_env.training = False     # do not update stats
+    eval_env.norm_reward = False  # report raw rewards (comparable to real env reward)
+
+    # Load model with the normalized eval env
+    model = PPO.load(model_path, env=eval_env, device="auto")
+
+    print("👀 Running trained agent with synchronized VecNormalize...")
+    for ep in range(EPISODES):
+        obs = eval_env.reset()
+        done = False
+        ep_reward = 0.0
+
+        # VecEnv uses arrays; unwrap flags carefully
+        terminated, truncated = False, False
+        while not (terminated or truncated):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, info = eval_env.step(action)
+            terminated, truncated = done, False
+            ep_reward += float(reward)
+
+            if RENDER:
+                time.sleep(1/120)
+
+
+        print(f"Episode {ep+1}: Total Reward = {ep_reward:.2f}")
+
+    eval_env.close()
+
+if __name__ == "__main__":
+    main()
