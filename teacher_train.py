@@ -1,187 +1,264 @@
-import gymnasium as gym
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.distributions import Normal
-import numpy as np
-import collections
-import time
-import wandb # Ensure you have wandb installed: pip install wandb
+# teacher_train_ppo_tuned.py
+"""
+Improved PPO trainer for HumanoidStandup-v5.
 
-# Import Stable Baselines3 PPO
+- Larger networks, larger batch sizes, linear LR schedule
+- Autosave VecNormalize stats and best_model
+- Eval + checkpoint callbacks
+- Optional quick local sweep over a few hyperparam combos for fast checks
+
+Run:
+    python teacher_train_ppo_tuned.py --run-name test_run
+
+Quick local sweep (short runs for comparison):
+    python teacher_train_ppo_tuned.py --local-sweep --sweep-steps 2000000
+
+Notes:
+ - Run from a terminal (not an interactive notebook) due to SubprocVecEnv.
+ - Requires stable-baselines3, gymnasium[mujoco], wandb.
+"""
+from __future__ import annotations
+import os, time, argparse
+from typing import Dict, Any, List, Tuple
+import numpy as np
+import wandb
+import gymnasium as gym
+
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.logger import configure
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize, VecEnv
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback
+from wandb.integration.sb3 import WandbCallback
 
-# --- Configuration and Hyperparameters ---
-ENV_NAME = "HumanoidStandup-v5"
-LEARNING_RATE = 3e-4 # PPO default in SB3 is often 3e-4
-GAMMA = 0.99
-GAE_LAMBDA = 0.95
-CLIP_EPSILON = 0.2 # This is handled internally by SB3 PPO
-PPO_EPOCHS = 10    # This is handled internally by SB3 PPO
-MINIBATCH_SIZE = 64 # This is handled internally by SB3 PPO
-TIMESTEPS_PER_BATCH = 2048 # This is `n_steps` in SB3 PPO
-TOTAL_TIMESTEPS = 5_000_000 # Total environment steps for training
-LOG_INTERVAL = 1       # Log every X updates (SB3 logs per training update)
-SAVE_INTERVAL = 500_000   # Save model every X timesteps (approximate)
-
-# Set device for GPU acceleration
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {DEVICE}")
-
-# --- Weights & Biases Callback for Stable Baselines3 ---
-# This custom callback will log metrics to W&B during SB3 training
-class WandbCallback(BaseCallback):
-    def __init__(self, verbose: int = 0):
+# ----------------------------
+# Callbacks
+# ----------------------------
+class AutoSaveVecNormCallback(BaseCallback):
+    """Periodically save VecNormalize stats to disk and at training end."""
+    def __init__(self, save_dir: str, every_steps: int = 100_000, verbose: int = 0):
         super().__init__(verbose)
-        self.episode_rewards = []
-        self.episode_lengths = []
-        self.last_log_timesteps = 0
-        self.start_time = time.time()
+        self.save_dir = save_dir
+        self.every_steps = every_steps
+        self._last = 0
+        os.makedirs(self.save_dir, exist_ok=True)
 
-    def _on_training_start(self) -> None:
-        # Initialize W&B run here if not already done by main script
-        if wandb.run is None:
-            wandb.init(project="humanoid-drl-teacher", name="ppo_teacher_humanoid_standup_v5_render_sb3", config=self.locals['self'].get_parameters())
-            wandb.watch(self.locals['self'].policy, log_freq=1000) # Log policy weights/gradients
+    def _save(self):
+        env = self.model.get_env()
+        if isinstance(env, VecNormalize):
+            path = os.path.join(self.save_dir, "vecnormalize.pkl")
+            env.save(path)
+            if self.verbose:
+                print(f"[AutoSaveVecNorm] saved to {path}")
 
     def _on_step(self) -> bool:
-        # Log episode rewards and lengths as they complete
-        # Note: self.locals['dones'] and self.locals['rewards'] are from the vectorized environment.
-        # If using make_vec_env, these will be arrays.
-        # If using a single env wrapped by DummyVecEnv, they will be single-element arrays.
-        if self.locals['dones'] is not None:
-            for i, done in enumerate(self.locals['dones']):
-                if done:
-                    # Accessing rewards/infos from the vectorized environment
-                    # For a single environment, self.locals['rewards'] will be a 1-element array
-                    # self.locals['infos'] will be a list of dicts
-                    episode_reward = self.locals['rewards'][i]
-                    # SB3's info dict for gymnasium environments includes episode stats
-                    episode_info = self.locals['infos'][i].get('episode')
-                    episode_length = episode_info.get('l', 0) if episode_info else 0
-                    
-                    wandb.log({
-                        "episode_reward": episode_reward,
-                        "episode_length": episode_length,
-                        "timesteps": self.num_timesteps,
-                        "time_elapsed": time.time() - self.start_time
-                    }, step=self.num_timesteps)
-                    
-                    # For terminal logging
-                    self.episode_rewards.append(episode_reward)
-                    self.episode_lengths.append(episode_length)
+        if self.num_timesteps - self._last >= self.every_steps:
+            self._last = self.num_timesteps
+            self._save()
+        return True
 
-        # Log training metrics from SB3's logger to W&B
-        # This condition ensures logging happens after a full `n_steps` batch is processed
-        if self.num_timesteps - self.last_log_timesteps >= self.model.n_steps:
-            self.last_log_timesteps = self.num_timesteps
-            
-            # Get metrics from SB3's internal logger using name_to_value
-            logger_dict = self.logger.name_to_value
-            
-            # Filter out non-scalar values and log
-            log_data = {k: v for k, v in logger_dict.items() if isinstance(v, (int, float))}
-            log_data["global_timesteps"] = self.num_timesteps
-            wandb.log(log_data, step=self.num_timesteps)
+    def _on_training_end(self) -> None:
+        self._save()
 
-            # Terminal logging for batch summary
-            if self.episode_rewards:
-                avg_reward_since_last_log = np.mean(self.episode_rewards)
-                avg_length_since_last_log = np.mean(self.episode_lengths)
-            else:
-                avg_reward_since_last_log = 0
-                avg_length_since_last_log = 0
+class ScalarLogCallback(BaseCallback):
+    """Push SB3 scalar logger values to W&B at an interval."""
+    def __init__(self, log_interval_steps: int = 2000, verbose: int = 0):
+        super().__init__(verbose)
+        self.interval = log_interval_steps
+        self._last = 0
+        self._t0 = time.time()
 
-            print(f"\n--- Batch Summary (Timesteps: {self.num_timesteps}) ---")
-            print(f"Time Elapsed: {time.time() - self.start_time:.2f} seconds")
-            print(f"Avg Episode Reward (since last log): {avg_reward_since_last_log:.2f}")
-            print(f"Avg Episode Length (since last log): {avg_length_since_last_log:.2f}")
-            # Access specific keys from logger_dict for losses
-            print(f"Policy Loss: {logger_dict.get('train/policy_loss', 0):.4f}, Value Loss: {logger_dict.get('train/value_loss', 0):.4f}\n")
-            
-            self.episode_rewards = []
-            self.episode_lengths = []
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self._last >= self.interval:
+            self._last = self.num_timesteps
+            d = self.logger.name_to_value
+            keys = [
+                "rollout/ep_rew_mean", "rollout/ep_len_mean",
+                "train/policy_loss", "train/value_loss",
+                "train/entropy_loss", "train/approx_kl",
+                "train/clip_fraction", "train/explained_variance",
+                "time/iterations", "time/fps"
+            ]
+            payload = {k: d[k] for k in keys if k in d}
+            payload["global_timesteps"] = self.num_timesteps
+            payload["time_elapsed_s"] = time.time() - self._t0
+            if payload:
+                wandb.log(payload, step=self.num_timesteps)
+        return True
 
-        # Save model checkpoint
-        # This condition ensures saving happens approximately every SAVE_INTERVAL timesteps
-        # by checking if the current timesteps have crossed a multiple of SAVE_INTERVAL
-        # since the last save point, and also ensuring it's not saving every single step.
-        if (self.num_timesteps // SAVE_INTERVAL) > (self.last_log_timesteps // SAVE_INTERVAL):
-             model_save_path = f"policies/teacher_policy_timesteps_{self.num_timesteps}.zip"
-             self.model.save(model_save_path)
-             wandb.save(model_save_path)
-             print(f"Model saved to {model_save_path}")
-        #      model_save_path = f"policies/teacher_policy_timesteps_{self.num_timesteps}.zip"
-        #      self.model.save(model_save_path)
-        #      wandb.save(model_save_path)
-        #      print(f"Model saved to {model_save_path}")
+# ----------------------------
+# Helpers (env builders)
+# ----------------------------
+def build_train_env(env_name: str, n_envs: int, seed: int, use_vecnorm: bool,
+                    clip_obs: float, clip_reward: float) -> VecEnv:
+    env = make_vec_env(env_name, n_envs=n_envs, vec_env_cls=SubprocVecEnv, seed=seed)
+    if use_vecnorm:
+        env = VecNormalize(env, training=True, norm_obs=True, norm_reward=True,
+                           clip_obs=clip_obs, clip_reward=clip_reward)
+    return env
 
-        return True # Continue training
+def build_eval_env(env_name: str, seed: int, use_vecnorm: bool, clip_obs: float) -> VecEnv:
+    env = make_vec_env(env_name, n_envs=1, vec_env_cls=DummyVecEnv, seed=seed+123)
+    if use_vecnorm:
+        env = VecNormalize(env, training=False, norm_obs=True, norm_reward=False, clip_obs=clip_obs)
+    return env
 
-# --- Main Training Loop ---
-def train():
-    # Define a function to create the environment with rendering
-    def make_env_with_render():
-        return gym.make(ENV_NAME, render_mode='human')
+# ----------------------------
+# LR schedule helper
+# ----------------------------
+def linear_schedule(initial_value: float):
+    def lr_fn(progress_remaining: float):
+        return progress_remaining * initial_value
+    return lr_fn
 
-    # Create the vectorized environment using the factory function
-    # This ensures render_mode='human' is passed to the underlying gym.make call
-    env = make_vec_env(make_env_with_render, n_envs=1) 
+# ----------------------------
+# Single-run trainer
+# ----------------------------
+def run_single(cfg: Dict[str, Any], run_name: str):
+    # init W&B
+    run = wandb.init(project=cfg["project"], name=run_name, config=cfg, sync_tensorboard=True, reinit=True)
 
-    # Define policy kwargs for the PPO model (e.g., network architecture)
-    policy_kwargs = dict(
-        net_arch=[dict(pi=[256, 256], vf=[256, 256])] # Two hidden layers of 256 neurons for actor (pi) and critic (vf)
+    save_path = cfg.get("save_path") or f"models/{run.id}"
+    os.makedirs(save_path, exist_ok=True)
+
+    print("Building train & eval envs...")
+    train_env = build_train_env(cfg["env_name"], cfg["n_envs"], cfg["seed"], cfg["use_vecnormalize"], cfg["clip_obs"], cfg["clip_reward"])
+    eval_env = build_eval_env(cfg["env_name"], cfg["seed"], cfg["use_vecnormalize"], cfg["clip_obs"])
+
+    # callbacks
+    wandb_cb = WandbCallback(model_save_path=save_path, verbose=0)
+    scalar_cb = ScalarLogCallback(log_interval_steps=cfg["log_interval_steps"])
+    autosave_cb = AutoSaveVecNormCallback(save_dir=save_path, every_steps=cfg["vecnorm_save_every"], verbose=1)
+    checkpoint_cb = CheckpointCallback(save_freq=cfg["checkpoint_every"], save_path=save_path, name_prefix="ppo_cp")
+
+    eval_cb = EvalCallback(
+        eval_env,
+        best_model_save_path=save_path,
+        log_path=save_path,
+        eval_freq=cfg["eval_freq"],
+        n_eval_episodes=cfg["n_eval_episodes"],
+        deterministic=True,
+        render=False,
     )
 
-    # Initialize the PPO agent
+    # policy kwargs
+    policy_kwargs = dict(net_arch=dict(pi=cfg["pi_arch"], vf=cfg["vf_arch"]))
+
+    # LR schedule (callable supported by SB3)
+    lr = linear_schedule(cfg["learning_rate"]) if cfg["use_lr_schedule"] else cfg["learning_rate"]
+
+    # build model
+    print("Creating PPO model...")
     model = PPO(
-        "MlpPolicy", # Multi-layer Perceptron policy
-        env,
-        learning_rate=LEARNING_RATE,
-        n_steps=TIMESTEPS_PER_BATCH, # Number of steps to run for each environment per update
-        batch_size=MINIBATCH_SIZE,   # Minibatch size for PPO's inner loop
-        n_epochs=PPO_EPOCHS,         # Number of epochs for PPO's inner loop
-        gamma=GAMMA,
-        gae_lambda=GAE_LAMBDA,
-        clip_range=CLIP_EPSILON,
-        verbose=0, # Set to 1 or 2 for SB3's default logging, 0 to rely on our callback
-        device=DEVICE,
+        policy=cfg["policy_type"],
+        env=train_env,
+        learning_rate=lr,
+        n_steps=cfg["n_steps"],
+        batch_size=cfg["batch_size"],
+        n_epochs=cfg["n_epochs"],
+        gamma=cfg["gamma"],
+        gae_lambda=cfg["gae_lambda"],
+        clip_range=cfg["clip_range"],
+        ent_coef=cfg["ent_coef"],
+        vf_coef=cfg["vf_coef"],
+        max_grad_norm=cfg["max_grad_norm"],
+        target_kl=cfg["target_kl"],
+        use_sde=cfg["use_sde"],
+        sde_sample_freq=cfg["sde_sample_freq"],
         policy_kwargs=policy_kwargs,
-        tensorboard_log="./sb3_logs/" # SB3's internal TensorBoard logging
-    )
-    
-    # Configure SB3's logger to use W&B
-    new_logger = configure(folder=None, format_strings=["stdout", "csv", "tensorboard"])
-    model.set_logger(new_logger)
-
-    # Initialize W&B run (if not already initialized by callback)
-    if wandb.run is None:
-        wandb.init(project="humanoid-drl-teacher", name="ppo_teacher_humanoid_standup_v5_headless_sb3", config=model.get_parameters())
-        wandb.watch(model.policy, log_freq=1000)
-
-    # Train the agent
-    print(f"Starting training for {TOTAL_TIMESTEPS} timesteps...")
-    model.learn(
-        total_timesteps=TOTAL_TIMESTEPS,
-        callback=WandbCallback(),
-        log_interval=LOG_INTERVAL, # This is for SB3's internal logger, not our custom callback
-        progress_bar=True # Show a progress bar
+        verbose=1,
+        tensorboard_log=f"runs/{run.id}",
+        seed=cfg["seed"],
+        device="auto",
     )
 
-    env.close()
-    print("\n--- Training Complete ---")
-    final_model_path = "policies/teacher_policy_final_sb3.zip"
-    model.save(final_model_path)
-    wandb.save(final_model_path) # Save final model to W&B
-    wandb.finish()
+    callbacks = [wandb_cb, eval_cb, autosave_cb, scalar_cb, checkpoint_cb]
+    print("Starting training...")
+    model.learn(total_timesteps=cfg["total_timesteps"], callback=callbacks, log_interval=1, progress_bar=True)
+
+    # final save
+    final_model = os.path.join(save_path, "teacher_policy_final_ppo.zip")
+    model.save(final_model)
+    if isinstance(train_env, VecNormalize):
+        train_env.save(os.path.join(save_path, "vecnormalize.pkl"))
+
+    wandb.save(final_model)
+    if isinstance(train_env, VecNormalize):
+        wandb.save(os.path.join(save_path, "vecnormalize.pkl"))
+    run.finish()
+    print("Training finished. Artifacts saved to:", save_path)
+
+# ----------------------------
+# Quick local sweep runner (sequential)
+# ----------------------------
+def run_local_sweep(base_cfg: Dict[str, Any], variants: List[Dict[str, Any]], steps_per_trial: int):
+    for i, v in enumerate(variants):
+        cfg = base_cfg.copy()
+        cfg.update(v)
+        cfg["total_timesteps"] = steps_per_trial
+        run_name = f"local_sweep_{i}_{int(time.time())}"
+        print(f"\n=== Local sweep trial {i} - run name: {run_name} - params: {v} ===\n")
+        run_single(cfg, run_name)
+
+# ----------------------------
+# Entrypoint & default config
+# ----------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--project", type=str, default="HumanoidStandup-Optimal")
+    parser.add_argument("--local-sweep", action="store_true", help="Run small local hyperparam comparison (sequential short runs)")
+    parser.add_argument("--sweep-steps", type=int, default=2_000_000, help="steps for each local sweep trial")
+    parser.add_argument("--save-path", type=str, default=None)
+    args = parser.parse_args()
+
+    # Base configuration tuned to push beyond ~2.5e5
+    base_cfg: Dict[str, Any] = dict(
+        project=args.project,
+        save_path=args.save_path,
+        env_name="HumanoidStandup-v5",
+        policy_type="MlpPolicy",
+        n_envs=16,                   # more parallel envs
+        total_timesteps=35_000_000,  # increase training budget
+        learning_rate=3e-4,
+        use_lr_schedule=True,
+        n_steps=4096,                # large rollout buffer
+        batch_size=4096,
+        n_epochs=20,
+        gamma=0.997,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.005,              # slightly reduce entropy bonus
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        target_kl=0.02,
+        use_sde=True,
+        sde_sample_freq=4,
+        pi_arch=[1024, 1024, 512],
+        vf_arch=[1024, 1024, 512],
+        use_vecnormalize=True,
+        clip_obs=10.0,
+        clip_reward=50.0,           # allow larger reward signal before clipping
+        log_interval_steps=2000,
+        vecnorm_save_every=100_000,
+        eval_freq=20_000,
+        n_eval_episodes=8,
+        checkpoint_every=500_000,
+        seed=0,
+    )
+
+    # If local sweep requested, try a few promising combos quickly
+    if args.local_sweep:
+        # variants to try: combos of lr and ent_coef (and optionally n_steps)
+        variants = [
+            {"learning_rate": 3e-4, "ent_coef": 0.005},
+            {"learning_rate": 2e-4, "ent_coef": 0.005},
+            {"learning_rate": 1.5e-4, "ent_coef": 0.01},
+            {"learning_rate": 4e-4, "ent_coef": 0.0025},
+        ]
+        run_local_sweep(base_cfg, variants, steps_per_trial=args.sweep_steps)
+    else:
+        run_name = args.run_name or f"ppo_tuned_{int(time.time())}"
+        run_single(base_cfg, run_name)
 
 if __name__ == "__main__":
-    # Create directories if they don't exist
-    import os
-    os.makedirs('policies', exist_ok=True)
-    os.makedirs('sb3_logs', exist_ok=True) # For SB3's internal tensorboard logs
-    
-    train()
+    main()
