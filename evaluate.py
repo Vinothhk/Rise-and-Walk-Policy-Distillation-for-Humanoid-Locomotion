@@ -5,16 +5,20 @@ from stable_baselines3 import SAC,PPO
 import time
 import os
 
+import gymnasium_robotics
+
+gym.register_envs(gymnasium_robotics)
+
 # --- IMPORTANT: UPDATE THIS PATH ---
 # Path to the saved model, found in 'models/{run_id}/best_model.zip'
-MODEL_PATH = "models/ppo1/best_model.zip" 
-ENV_NAME = "HumanoidStandup-v5"
+MODEL_PATH = "models/0yc4uoef/best_model.zip" 
+ENV_NAME = "Humanoid-v5"
 # ------------------------------------
 
 if not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(f"Model file not found at {MODEL_PATH}.")
 
-env = gym.make(ENV_NAME, render_mode="human")
+env = gym.make(ENV_NAME,max_episode_steps=2000, render_mode="human")
 model = PPO.load(MODEL_PATH, env=env)
 
 print("👀 Running trained agent...")
