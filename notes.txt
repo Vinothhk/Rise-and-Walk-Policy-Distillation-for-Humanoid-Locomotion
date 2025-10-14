@@ -2,3 +2,51 @@ sac-teacher : Already best and logged in WANDB (humanoid-drl-teacher)
 teacher-train: PPO and Logged in WANDB humanoid-drl-teacher
 
 teacher-train-sac: trying to find optimal
+
+optimalppo: current best ppo
+trained for 30_000_000 timesteps
+
+
+config = {
+    "policy_type": "MlpPolicy",
+    "env_name": "HumanoidStandup-v5",
+    "n_envs": 16,   # more parallel envs → more diverse data, faster convergence
+
+    # Training budget
+    "total_timesteps": 50_000_000,   # double your old budget for stability
+
+    # PPO core
+    "learning_rate": 1e-4,           # smaller LR → more stable learning
+    "n_steps": 8192,                 # per-env rollout length (longer horizons help)
+    "batch_size": 4096,              # match larger n_steps*n_envs
+    "n_epochs": 20,                  # more optimization passes
+
+    # Advantage estimation & discounting
+    "gamma": 0.999,                  # longer-term credit assignment
+    "gae_lambda": 0.95,
+
+    # PPO clipping & regularization
+    "clip_range": 0.2,
+    "ent_coef": 0.002,               # lower entropy penalty → more exploitation
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "target_kl": 0.01,               # stricter early stopping for stability
+
+    # Exploration
+    "use_sde": True,
+    "sde_sample_freq": 4,
+
+    # Policy architecture (deeper & wider net)
+    "policy_kwargs": dict(net_arch=dict(pi=[1024, 1024, 512],
+                                        vf=[1024, 1024, 512])),
+
+    # Normalization
+    "use_vecnormalize": True,
+    "clip_obs": 10.0,
+    "clip_reward": 10.0,
+
+    # Logging & saving
+    "log_interval_steps": 5_000,
+    "vecnorm_save_every": 200_000,
+    "seed": 0,
+}
